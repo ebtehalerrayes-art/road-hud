@@ -548,7 +548,7 @@
 
         <div class="main">
           <div class="card chartCard">
-            <div class="cardHeader">ROAD CHAR</div>
+            <div class="cardHeader">ROAD CHART</div>
             <div class="cardBody">
               <div class="chartArea">
                 <div class="legend">
@@ -563,8 +563,8 @@
 
           <div class="card telemetryCard">
             <div class="cardBody telemetry">
-              <div class="row"><div class="k">Location:</div><div id="loc" class="v">[- - , - -]</div></div>
-              <div class="row"><div class="k">Hole Location:</div><div id="holeLoc" class="v">[- - , - -]</div></div>
+              <div class="row"><div class="k">Location:</div><div id="loc" class="v">-- m</div></div>
+              <div class="row"><div class="k">Hole Location:</div><div id="holeLoc" class="v">-- m</div></div>
 
               <div class="row span2" style="min-height:78px;">
                 <div class="k">Drilling depth/cm:</div>
@@ -606,8 +606,8 @@
                     <div class="ghost"></div>
                   </div>
 
-                  <div id="moveLine" class="moveLine">MOTOR=STOP | SPEED=0%</div>
-                  <div id="hint" class="hint">LIVE DATA • Waiting…</div>
+                  <div id="moveLine" class="moveLine">MOTOR=STOP | SPEED=?</div>
+                  <div id="hint" class="hint">ThingSpeak • Disconnected</div>
                 </div>
 
               </div>
@@ -620,28 +620,25 @@
   </div><!-- /wrap -->
 
   <script>
-    /* ===== LIVE MODE (NO SIMULATION) =====
-       This version expects an API endpoint that returns JSON telemetry.
-       Default endpoint: /api
-       Example JSON:
-       {
-         "lat": 32.8872, "lon": 13.1913,
-         "holeLat": 32.8871, "holeLon": 13.1912,
-         "depth": 6.4,
-         "holeCount": 3,
-         "state": "HOLE",            // "NORMAL" | "TILT" | "HOLE"
-         "vibration": 1              // 0/1 (optional)
-       }
-    */
+    /* =========================
+       ThingSpeak CONFIG (YOURS)
+       ========================= */
+    const TS_CH_ID   = 3231190;
+    const TS_READKEY = "QQLHKBK87LP878Z1";
 
-    const HZ = 10, DT = 1000 / HZ, N = 72, Y_LIMIT = 3.2;
-    const STATE = { NORMAL:"NORMAL", HOLE:"HOLE", TILT:"TILT" };
+    const TB_ID  = 56199;
+    const TB_KEY = "1HYYVXWZHSGZU6I7";
 
-    // ✅ change this to your robot IP if needed:
-    // const BASE = "http://192.168.4.1";
-    const BASE = "";
-    const API_URL = BASE + "/api";
-    const MOVE_URL = BASE + "/move?dir="; // optional: forward/left/right/reverse/stop
+    /* =========================
+       UI + CHART CONFIG
+       ========================= */
+    const HZ = 2;                 // UI refresh (page poll). Real data updates when Arduino uploads (~16s)
+    const DT = 1000 / HZ;
+    const N = 72;
+    const Y_LIMIT = 3.2;
+
+    // Chart state buckets
+    const STATE = { NORMAL:"NORMAL", HOLE:"HOLE", TILT:"TILT", BOTH:"BOTH" };
 
     const btnStart = document.getElementById("btnStart");
     const btnReset = document.getElementById("btnReset");
@@ -658,11 +655,20 @@
     const lampHole   = document.getElementById("lampHole");
     const lampVib    = document.getElementById("lampVib");
     const lampTilt   = document.getElementById("lampTilt");
-
-    const moveLine = document.getElementById("moveLine");
+    const moveLine   = document.getElementById("moveLine");
 
     let polling = false;
     let timer = null;
+    let lastFeedAtMs = 0;
+
+    function clamp(x,a,b){ return Math.max(a, Math.min(b,x)); }
+    function setLamp(el,on){ el.classList.toggle("on", !!on); }
+
+    function setConnected(on, msg){
+      pillCon.style.opacity = on ? "1" : ".35";
+      pillDis.style.opacity = on ? ".35" : "1";
+      hint.textContent = msg || (on ? "ThingSpeak • Connected" : "ThingSpeak • Disconnected");
+    }
 
     // chart buffers
     const labels = Array.from({length:N}, (_,i)=> i);
@@ -675,15 +681,6 @@
       tilt:   css.getPropertyValue('--blue').trim(),
       hole:   css.getPropertyValue('--red').trim()
     };
-
-    function clamp(x,a,b){ return Math.max(a, Math.min(b,x)); }
-    function setLamp(el,on){ el.classList.toggle("on", !!on); }
-
-    function setConnected(on){
-      pillCon.style.opacity = on ? "1" : ".35";
-      pillDis.style.opacity = on ? ".35" : "1";
-      hint.textContent = on ? "LIVE DATA • Connected" : "LIVE DATA • Disconnected";
-    }
 
     const glowPlugin = {
       id:"glowPlugin",
@@ -777,71 +774,111 @@
       plugins:[glowPlugin, heatPlugin]
     });
 
-    // Map incoming data -> chart y-value
-    // You can change this mapping to your sensor value (e.g., accelZ, pitch, vibration magnitude)
-    function mapToY(data){
-      // priority: data.roadY (if you send it), else use depth sign, else 0
-      if(typeof data.roadY === "number") return clamp(data.roadY, -Y_LIMIT, Y_LIMIT);
-      if(data.state === "HOLE" && typeof data.depth === "number") return clamp(-Math.abs(data.depth)/3, -Y_LIMIT, Y_LIMIT);
-      if(data.state === "TILT" && typeof data.tilt === "number") return clamp(data.tilt/10, -Y_LIMIT, Y_LIMIT);
-      return 0;
+    /* =========================
+       ThingSpeak READ
+       fields:
+       field1 distanceM
+       field2 lastDepthCm
+       field3 holeCount
+       field4 lastHoleDistanceM
+       field5 roadStateCode (0..3)
+       ========================= */
+    function codeToState(code){
+      if(code===1) return STATE.TILT;
+      if(code===2) return STATE.HOLE;
+      if(code===3) return STATE.BOTH;
+      return STATE.NORMAL;
     }
 
-    function applyTelemetry(data){
-      if(typeof data.lat === "number" && typeof data.lon === "number"){
-        elLoc.textContent = `[${data.lat.toFixed(4)}, ${data.lon.toFixed(4)}]`;
-      }
-
-      if(typeof data.holeLat === "number" && typeof data.holeLon === "number"){
-        elHoleLoc.textContent = `[${data.holeLat.toFixed(4)}, ${data.holeLon.toFixed(4)}]`;
-      }
-
-      if(typeof data.depth === "number"){
-        elDepth.textContent = data.depth.toFixed(1);
-      }else{
-        elDepth.textContent = "--";
-      }
-
-      if(typeof data.holeCount === "number"){
-        elHoleCount.textContent = String(data.holeCount);
-      }
-
-      const st = (data.state && STATE[data.state]) ? data.state : "NORMAL";
-      setLamp(lampNormal, st === "NORMAL");
-      setLamp(lampHole,   st === "HOLE");
-      setLamp(lampTilt,   st === "TILT");
-
-      const vib = (data.vibration === 1 || data.vibration === true);
-      setLamp(lampVib, vib);
+    function stateToChartY(st){
+      // simple stable mapping (nice look)
+      if(st===STATE.HOLE) return -2.7;
+      if(st===STATE.TILT) return  2.2;
+      if(st===STATE.BOTH) return -1.6;
+      return 0.0;
     }
 
-    function pushChart(data){
-      const st = (data.state && STATE[data.state]) ? data.state : "NORMAL";
-      const next = mapToY(data);
+    async function getLatestFeed(){
+      const url = `https://api.thingspeak.com/channels/${TS_CH_ID}/feeds.json?api_key=${TS_READKEY}&results=1`;
+      const r = await fetch(url, {cache:"no-store"});
+      if(!r.ok) throw new Error("TS read failed");
+      const data = await r.json();
+      const f = data.feeds && data.feeds[0];
+      if(!f) throw new Error("No feed");
 
+      const createdAt = f.created_at ? Date.parse(f.created_at) : NaN;
+
+      return {
+        createdAt,
+        distanceM: Number(f.field1 || 0),
+        depthCm:   Number(f.field2 || 0),
+        holeCount: Number(f.field3 || 0),
+        holeLocM:  Number(f.field4 || 0),
+        stateCode: Number(f.field5 || 0),
+      };
+    }
+
+    function applyTelemetryTS(t){
+      // Mapping حسب طلبك
+      elLoc.textContent     = `${t.distanceM.toFixed(2)} m`;
+      elHoleLoc.textContent = `${t.holeLocM.toFixed(2)} m`;
+      elDepth.textContent   = (t.depthCm > 0 ? t.depthCm.toFixed(1) : "--");
+      elHoleCount.textContent = String(Math.max(0, Math.trunc(t.holeCount)));
+
+      const st = codeToState(t.stateCode);
+
+      setLamp(lampNormal, st === STATE.NORMAL);
+      setLamp(lampTilt,   st === STATE.TILT);
+      setLamp(lampHole,   st === STATE.HOLE);
+
+      // VIBRATION lamp: نخليها تشتعل وقت pothole/both
+      setLamp(lampVib, (st === STATE.HOLE || st === STATE.BOTH));
+
+      // Chart push
+      const next = stateToChartY(st);
       y.push(next);
       stArr.push(st);
       labels.push(labels[labels.length-1] + 1);
-
       y.shift(); stArr.shift(); labels.shift();
-
       roadChart.update("none");
+
+      // Freshness
+      const now = Date.now();
+      if(!Number.isNaN(t.createdAt)) lastFeedAtMs = t.createdAt;
+      const age = (now - lastFeedAtMs) / 1000;
+      const ok = age < 45; // لو تعدّت ~45s اعتبرها disconnected
+      const stamp = new Date(lastFeedAtMs || now).toLocaleTimeString();
+      setConnected(ok, ok ? `ThingSpeak • LIVE • ${stamp} (${age.toFixed(0)}s)` : `ThingSpeak • STALE • ${stamp} (${age.toFixed(0)}s)`);
     }
 
-    async function fetchOnce(){
-      const r = await fetch(API_URL, { cache:"no-store" });
-      if(!r.ok) throw new Error("HTTP " + r.status);
-      return await r.json();
+    /* =========================
+       TalkBack SEND (Commands)
+       ========================= */
+    async function tbSend(cmd){
+      const url = `https://api.thingspeak.com/talkbacks/${TB_ID}/commands?api_key=${TB_KEY}&command_string=${encodeURIComponent(cmd)}`;
+      // GET add command
+      await fetch(url, {cache:"no-store"});
     }
 
+    function cmdFromMove(move){
+      // map UI -> command strings used by Arduino
+      if(move === "forward") return "CMD:F";
+      if(move === "reverse") return "CMD:B";
+      if(move === "stop")    return "CMD:S";
+      if(move === "left")    return "STEER:L";
+      if(move === "right")   return "STEER:R";
+      return "";
+    }
+
+    /* =========================
+       Poll loop
+       ========================= */
     async function poll(){
       try{
-        const data = await fetchOnce();
-        setConnected(true);
-        applyTelemetry(data);
-        pushChart(data);
+        const t = await getLatestFeed();
+        applyTelemetryTS(t);
       }catch(e){
-        setConnected(false);
+        setConnected(false, "ThingSpeak • Disconnected");
       }
     }
 
@@ -857,15 +894,15 @@
       polling = false;
       btnStart.textContent = "CONNECT";
       if(timer){ clearInterval(timer); timer = null; }
-      setConnected(false);
+      setConnected(false, "ThingSpeak • Disconnected");
     }
 
-    function doReset(){
-      // UI reset (does NOT send reset to robot — if you want, add fetch("/reset"))
+    async function doReset(){
+      // UI reset
       elHoleCount.textContent = "0";
       elDepth.textContent = "--";
-      elHoleLoc.textContent = "[- - , - -]";
-      elLoc.textContent = "[- - , - -]";
+      elHoleLoc.textContent = "-- m";
+      elLoc.textContent = "-- m";
 
       setLamp(lampNormal, true);
       setLamp(lampHole, false);
@@ -878,25 +915,35 @@
         labels[i] = i;
       }
       roadChart.update("none");
+      moveLine.textContent = "MOTOR=STOP | SPEED=?";
 
-      moveLine.textContent = "MOTOR=STOP | SPEED=0%";
+      // Send RESET to device via TalkBack
+      try{
+        await tbSend("RESET");
+      }catch(e){}
     }
 
     // Connect/Disconnect
     btnStart.addEventListener("click", ()=> polling ? stopPolling() : startPolling());
     btnReset.addEventListener("click", doReset);
 
-    // Motor commands (optional). If you don't have /move endpoint, keep it but it won't hurt.
+    // Control buttons -> TalkBack
     document.querySelectorAll("[data-move]").forEach(b=>{
       b.addEventListener("click", async ()=>{
-        const cmd = b.getAttribute("data-move");
-        // UI only
-        if(cmd === "stop") moveLine.textContent = `MOTOR=STOP | SPEED=0%`;
-        else moveLine.textContent = `MOTOR=${cmd.toUpperCase()} | SPEED=?`;
+        const move = b.getAttribute("data-move");
+        const cmd = cmdFromMove(move);
+        if(!cmd) return;
 
-        // Send to robot (optional)
+        // UI line
+        if(move === "stop") moveLine.textContent = "MOTOR=STOP | SPEED=?";
+        else if(move === "forward") moveLine.textContent = "MOTOR=FORWARD | SPEED=?";
+        else if(move === "reverse") moveLine.textContent = "MOTOR=REVERSE | SPEED=?";
+        else if(move === "left") moveLine.textContent = "STEER=LEFT | PULSE";
+        else if(move === "right") moveLine.textContent = "STEER=RIGHT | PULSE";
+
+        // Send command
         try{
-          await fetch(MOVE_URL + encodeURIComponent(cmd), { cache:"no-store" });
+          await tbSend(cmd);
         }catch(e){}
       });
     });
